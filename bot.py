@@ -1,3 +1,4 @@
+
 import telebot
 from telebot import types
 import threading
@@ -18,10 +19,16 @@ def run_flask():
 threading.Thread(target=run_flask, daemon=True).start()
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROUP_ID = '@driverservice_kg'
+GROUP_ID =     '@driverservice_kg'
 
 bot = telebot.TeleBot(TOKEN)
-bot.remove_webhook()
+while True:
+    try:
+        bot.remove_webhook()
+        break
+    except Exception as e:
+        print(f"Telegram API temporarily unavailable ({type(e).__name__}); retrying in 15 seconds")
+        time.sleep(15)
 user_data = {}
 user_languages = {}
 
