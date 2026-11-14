@@ -4,6 +4,7 @@ from telebot import types
 import threading
 import time
 import os
+import json
 from flask import Flask
 
 app = Flask(__name__)
@@ -17,7 +18,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 threading.Thread(target=run_flask, daemon=True).start()
-
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROUP_ID =     '@driverservice_kg'
 
@@ -27,14 +27,82 @@ while True:
         bot.remove_webhook()
         break
     except Exception as e:
-        print(f"Telegram API temporarily unavailable ({type(e).__name__}); retrying in 15 seconds")
+        error_code = getattr(e, "error_code", None)
+        error_text = str(e).lower()
+        if error_code == 401 or "unauthorized" in error_text or "error code: 401" in error_text:
+            raise RuntimeError("Telegram rejected the bot token. Check TELEGRAM_BOT_TOKEN in the Render environment.") from e
+        if error_code and error_code not in (429, 500, 502, 503, 504):
+            raise RuntimeError(f"Telegram API returned permanent startup error {error_code}.") from e
+        print(f"Telegram API temporarily unavailable ({type(e).__name__}, code={error_code}); retrying in 15 seconds")
         time.sleep(15)
 user_data = {}
 user_languages = {}
 
-# Uchet dobavlennyh lyudey: {user_id: kolichestvo}
-invited_counts = {}
-unlocked_users = set()
+# Counts are per group and only include distinct, non-bot users actually added.
+INVITE_DATA_FILE = os.environ.get("INVITE_DATA_FILE", "invite_data.json")
+invite_data_lock = threading.Lock()
+
+def load_invite_data():
+    try:
+        with open(INVITE_DATA_FILE, "r", encoding="utf-8") as data_file:
+            saved = json.load(data_file)
+        if not isinstance(saved, dict):
+            return {}, {}, {}
+        return (
+            saved.get("invited_counts", {}),
+            saved.get("unlocked_users", {}),
+            saved.get("seen_members", {}),
+        )
+    except FileNotFoundError:
+        return {}, {}, {}
+    except (OSError, ValueError, TypeError) as e:
+        print(f"Could not load invite progress: {e}")
+        return {}, {}, {}
+
+def save_invite_data():
+    data = {
+        "invited_counts": invited_counts,
+        "unlocked_users": {group_id: list(user_ids) for group_id, user_ids in unlocked_users.items()},
+        "seen_members": {group_id: list(user_ids) for group_id, user_ids in seen_members.items()},
+    }
+    temp_path = INVITE_DATA_FILE + ".tmp"
+    try:
+        parent_dir = os.path.dirname(os.path.abspath(INVITE_DATA_FILE))
+        os.makedirs(parent_dir, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as data_file:
+            json.dump(data, data_file, ensure_ascii=False)
+        os.replace(temp_path, INVITE_DATA_FILE)
+    except OSError as e:
+        print(f"Could not save invite progress: {e}")
+
+saved_counts, saved_unlocks, saved_seen = load_invite_data()
+def normalize_counts(raw_counts):
+    normalized = {}
+    if not isinstance(raw_counts, dict):
+        return normalized
+    for group_id, counts in raw_counts.items():
+        if not isinstance(counts, dict):
+            continue
+        normalized[str(group_id)] = {}
+        for user_id, count in counts.items():
+            try:
+                normalized[str(group_id)][str(user_id)] = max(0, int(count))
+            except (TypeError, ValueError):
+                continue
+    return normalized
+
+def normalize_id_sets(raw_sets):
+    normalized = {}
+    if not isinstance(raw_sets, dict):
+        return normalized
+    for group_id, user_ids in raw_sets.items():
+        if isinstance(user_ids, list):
+            normalized[str(group_id)] = {str(user_id) for user_id in user_ids}
+    return normalized
+
+invited_counts = normalize_counts(saved_counts)
+unlocked_users = normalize_id_sets(saved_unlocks)
+seen_members = normalize_id_sets(saved_seen)
 
 auto_posting_active = False
 auto_post_interval = 60  # Po umolchaniyu kazhdye 60 minut
@@ -98,29 +166,37 @@ def stop_auto(message):
 @bot.message_handler(content_types=['new_chat_members'])
 def welcome_new_member(message):
     inviter = message.from_user
-    if inviter and not inviter.is_bot:
-        inviter_id = inviter.id
-        added_count = len(message.new_chat_members)
-        
-        if inviter_id not in invited_counts:
-            invited_counts[inviter_id] = 0
-        invited_counts[inviter_id] += added_count
-        
-        current_total = invited_counts[inviter_id]
-        user_name = inviter.first_name
-        
+    if not inviter or inviter.is_bot:
+        return
+
+    new_member_ids = list(dict.fromkeys(
+        str(member.id) for member in message.new_chat_members if not member.is_bot
+    ))
+    # Joining through an invite link is not an addition made by the joiner.
+    if not new_member_ids or str(inviter.id) in new_member_ids:
+        return
+
+    group_id = str(message.chat.id)
+    inviter_id = str(inviter.id)
+    with invite_data_lock:
+        group_seen = seen_members.setdefault(group_id, set())
+        fresh_member_ids = [member_id for member_id in new_member_ids if member_id not in group_seen]
+        if not fresh_member_ids:
+            return
+
+        group_counts = invited_counts.setdefault(group_id, {})
+        current_total = group_counts.get(inviter_id, 0) + len(fresh_member_ids)
+        group_counts[inviter_id] = current_total
+        group_seen.update(fresh_member_ids)
         if current_total >= 10:
-            unlocked_users.add(inviter_id)
-            try:
-                bot.send_message(message.chat.id, f"🎉 Поздравляем, {user_name}! Вы добавили 10 человек и можете писать в группу!")
-            except:
-                pass
-        else:
-            remaining = 10 - current_total
-            try:
-                bot.send_message(message.chat.id, f"📌 {user_name}, вы добавили {current_total}/10 человек. Осталось добавить еще {remaining}.")
-            except:
-                pass
+            unlocked_users.setdefault(group_id, set()).add(inviter_id)
+        save_invite_data()
+
+    if current_total >= 10:
+        bot.send_message(message.chat.id, f"🎉 Поздравляем, {inviter.first_name}! Вы добавили 10 уникальных участников и можете писать в группе!")
+    else:
+        remaining = 10 - current_total
+        bot.send_message(message.chat.id, f"📌 {inviter.first_name}, засчитано {current_total}/10 участников. Осталось добавить еще {remaining}.")
 
 # Proverka soobsheniy v gruppe (bez knopok)
 def is_group_admin(message):
@@ -139,11 +215,8 @@ def is_group_admin(message):
         return False
 
 
-@bot.message_handler(func=lambda message: message.chat.type in ['group', 'supergroup'])
+@bot.message_handler(func=lambda message: message.chat.type in ['group', 'supergroup'] and message.text and not message.text.startswith('/'))
 def check_group_messages(message):
-    if not message.text or message.text.startswith('/'):
-        return
-
     # Group owners/admins and anonymous admins bypass the invite requirement.
     if is_group_admin(message):
         return
@@ -151,7 +224,8 @@ def check_group_messages(message):
     if not message.from_user:
         return
     user_id = message.from_user.id
-    if user_id in unlocked_users:
+    group_id = str(message.chat.id)
+    if str(user_id) in unlocked_users.get(group_id, set()):
         return
 
     try:
@@ -160,13 +234,12 @@ def check_group_messages(message):
         pass
 
     user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-    current_count = invited_counts.get(user_id, 0)
-    warning_text = f"‼️ 🚀 {user_mention}, вы добавили {current_count}/10 человек. Добавьте еще {10 - current_count}, чтобы писать в группе!"
+    current_count = invited_counts.get(group_id, {}).get(str(user_id), 0)
+    remaining = max(0, 10 - current_count)
+    warning_text = f"‼️ 🚀 {user_mention}, засчитано {current_count}/10 участников. Осталось добавить {remaining}, чтобы писать в группе.\n\nОткройте профиль группы → «Добавить участников» и выберите реальных людей. Засчитывается только фактическое добавление нового участника."
 
     markup = types.InlineKeyboardMarkup()
-    group_username = GROUP_ID.lstrip('@')
-    invite_button = types.InlineKeyboardButton('➕ Пригласить участников', url=f'https://t.me/{group_username}')
-    markup.add(invite_button)
+    markup.add(types.InlineKeyboardButton("ℹ️ Как добавить участников", callback_data="how_add_members"))
     try:
         bot.send_message(message.chat.id, warning_text, reply_markup=markup)
     except Exception as e:
@@ -178,12 +251,38 @@ def send_pinned_menu(message):
         markup = types.InlineKeyboardMarkup()
         btn_order = types.InlineKeyboardButton("Создать заказ", url="https://t.me/driver_service_kg_bot?start=order")
         markup.add(btn_order)
-        bot.send_message(message.chat.id, "🚗 DRIVER SERVICE\nНажмите кнопку ниже, чтобы создать заказ:", reply_markup=markup)
+        menu_message = bot.send_message(message.chat.id, "🚗 DRIVER SERVICE\nНажмите кнопку ниже, чтобы создать заказ:", reply_markup=markup)
+        try:
+            bot.pin_chat_message(message.chat.id, menu_message.message_id, disable_notification=True)
+        except Exception as e:
+            print(f"Could not pin the order menu; check the bot's pin permission: {e}")
+            bot.reply_to(message, "Меню заказа опубликовано. Чтобы бот закреплял его автоматически, выдайте ему право закреплять сообщения.")
+
+@bot.message_handler(commands=['my_invites'])
+def show_invite_progress(message):
+    if message.chat.type not in ['group', 'supergroup'] or not message.from_user:
+        bot.reply_to(message, "Команда /my_invites работает в группе.")
+        return
+    group_id = str(message.chat.id)
+    user_id = str(message.from_user.id)
+    current_total = invited_counts.get(group_id, {}).get(user_id, 0)
+    remaining = max(0, 10 - current_total)
+    bot.reply_to(message, f"У вас засчитано {current_total}/10 уникальных участников. Осталось: {remaining}.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "how_add_members")
+def explain_native_add_members(call):
+    bot.answer_callback_query(
+        call.id,
+        "Откройте профиль этой группы в Telegram → «Добавить участников» → выберите людей. Бот засчитает их после фактического добавления.",
+        show_alert=True,
+    )
 
 # Start v lichnyh soobshcheniyah
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_name = message.from_user.first_name
+    start_parts = (message.text or "").split(maxsplit=1)
+    is_order_link = len(start_parts) > 1 and start_parts[1].strip().startswith("order")
     markup = types.InlineKeyboardMarkup(row_width=2)
     btn_driver = types.InlineKeyboardButton("🚗 Водитель", callback_data="role_driver")
     btn_pass = types.InlineKeyboardButton("👤 Пассажир", callback_data="role_pass")
@@ -191,7 +290,7 @@ def send_welcome(message):
     
     bot.reply_to(
         message, 
-        f"🚗 DRIVER SERVICE\n\nЗдравствуйте, {user_name}! 👋\nВыберите вашу роль:",
+        (f"🚗 Создание заказа\n\nЗдравствуйте, {user_name}! 👋\nВыберите вашу роль:" if is_order_link else f"🚗 DRIVER SERVICE\n\nЗдравствуйте, {user_name}! 👋\nВыберите вашу роль:"),
         reply_markup=markup
     )
 
@@ -351,7 +450,12 @@ def ask_phone(message):
     bot.register_next_step_handler(message, finalize)
 
 def finalize(message):
-    if message.text and message.text.startswith('/'): return
+    if message.text and message.text.startswith('/'):
+        return
+    if not message.text:
+        bot.reply_to(message, "Пожалуйста, введите номер телефона текстом.")
+        bot.register_next_step_handler(message, finalize)
+        return
     data = user_data[message.chat.id]
     phone = message.text.strip()
     role = data['role']
@@ -395,8 +499,11 @@ def finalize(message):
         else:
             bot.send_message(chat_id=GROUP_ID, text=text, reply_markup=markup)
     except Exception as e:
-        print(f"Oshibka: {e}")
-            
+        print(f"Order publication failed: {e}")
+        bot.send_message(message.chat.id, "Не удалось опубликовать заказ в группе. Проверьте, что бот добавлен в группу и имеет право публиковать сообщения.")
+        return
+
+    user_data.pop(message.chat.id, None)
     bot.send_message(message.chat.id, "✅ Ваше объявление успешно опубликовано в группе!")
 
 print("DRIVER SERVICE bot is running...")
