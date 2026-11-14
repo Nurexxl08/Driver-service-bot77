@@ -2,8 +2,22 @@ import telebot
 from telebot import types
 import threading
 import time
+import os
+from flask import Flask
 
-TOKEN = '8243680262:AAF-4SqQSgvDZvmaiJBYcy-5kb9jZAUxr0w'
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Driver Service Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 7860))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+threading.Thread(target=run_flask, daemon=True).start()
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROUP_ID = '@driverservice_kg'
 
 bot = telebot.TeleBot(TOKEN)
