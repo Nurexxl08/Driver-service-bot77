@@ -215,6 +215,45 @@ def is_group_admin(message):
         return False
 
 
+@bot.message_handler(commands=['enable_invites'])
+def enable_member_invites(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        bot.reply_to(message, "Эта команда работает только в группе.")
+        return
+
+    if not is_group_admin(message):
+        bot.reply_to(message, "Включить приглашения может только администратор группы.")
+        return
+
+    try:
+        bot_member = bot.get_chat_member(message.chat.id, bot.get_me().id)
+        if bot_member.status != 'creator' and not getattr(bot_member, 'can_restrict_members', False):
+            bot.reply_to(
+                message,
+                "Сначала назначьте бота администратором и включите ему право «Блокировка пользователей» (Restrict members), затем повторите /enable_invites.",
+            )
+            return
+
+        chat = bot.get_chat(message.chat.id)
+        permissions = chat.permissions or types.ChatPermissions()
+        permissions.can_invite_users = True
+        bot.set_chat_permissions(
+            message.chat.id,
+            permissions,
+            use_independent_chat_permissions=True,
+        )
+        bot.reply_to(
+            message,
+            "Готово! Теперь все участники могут приглашать людей через профиль группы → «Добавить участников».",
+        )
+    except Exception as e:
+        print(f"Could not enable member invitations: {e}")
+        bot.reply_to(
+            message,
+            "Не удалось изменить права приглашения. Проверьте, что бот — администратор с правом «Блокировка пользователей» (Restrict members).",
+        )
+
+
 @bot.message_handler(func=lambda message: message.chat.type in ['group', 'supergroup'] and message.text and not message.text.startswith('/'))
 def check_group_messages(message):
     # Group owners/admins and anonymous admins bypass the invite requirement.
@@ -240,6 +279,7 @@ def check_group_messages(message):
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("ℹ️ Как добавить участников", callback_data="how_add_members"))
+    warning_text += "\n\nЕсли Telegram разрешает приглашать только администраторам, попросите администратора группы один раз отправить /enable_invites."
     try:
         bot.send_message(message.chat.id, warning_text, reply_markup=markup)
     except Exception as e:
